@@ -564,7 +564,8 @@ validation and analysis are disabled, as they are by default.
 
 ## `git`
 
-The Git source reads repository objects in-process with go-git. It never runs
+The Git source reads repository objects in-process using stable go-git v5 and
+Betterleaks' own object and pack readers. It never runs
 `git`, hooks, diff or textconv helpers, filters, SSH, or credential helpers, so
 scanning an untrusted repository cannot execute anything it configures.
 
@@ -573,8 +574,9 @@ directory. By default it scans the history reachable from HEAD and every ref
 except `refs/notes/*`, which has a separate `notes` resource. Each commit is
 compared with its first parent and added lines are scanned. Merge commits are
 walked through all parents but not diffed; `--include=merges` adds their
-patches. To scan added lines in staged or uncommitted working-tree
-changes, use the [patch workflow](#caller-supplied-patches).
+patches. Temporary ref files and directories ending in `.lock` are ignored.
+To scan added lines in staged or uncommitted working-tree changes, use the
+[patch workflow](#caller-supplied-patches).
 
 By default, HTTP(S) URL scans fetch branches (`refs/heads/*`), tags (`refs/tags/*`),
 and notes (`refs/notes/*`). This also applies to Git history fetched by the `github`,
@@ -695,7 +697,10 @@ content counts as unreachable. `objects` includes the unreachable blobs.
 - `--revision=REV` starts at one revision. `--revision=A..B` scans the commits
   reachable from B but not from A; `A..` means `A..HEAD` and `..B` means `HEAD..B`.
   `A...B` is not supported. This selects commits from available history; it does
-  not fetch additional refs.
+  not fetch additional refs. Abbreviated object IDs must identify a unique
+  commit or annotated tag that peels to a commit; ambiguous prefixes fail.
+  A full object ID naming a blob, tree, or missing object fails even if a branch
+  has the same name. Use `refs/heads/NAME` to select such a branch explicitly.
 - `--since` and `--until` filter by committer time, in RFC3339 or `YYYY-MM-DD`
   (UTC). A date-only `--until` includes that whole day. Filtering never prunes the
   walk, so backdated commits are still found.
@@ -806,6 +811,22 @@ stop the scan and mark it incomplete. `unreachable-objects` holds up to eight
 million object IDs to classify reachability; for larger repositories, use
 `objects`.
 
+Rename detection can choose different pairings when files have equal similarity
+scores. This inherited go-git behavior can change which added lines are scanned
+and occasionally change findings between runs.
+
+Local SHA-1 and SHA-256 repositories work in the same binary, without build
+tags. Reftable repositories and partial clones missing required objects are
+not supported; these produce incomplete scans rather than fetching missing
+objects. Config files are limited to 16 MiB, individual refs to 1 MiB, and
+ref directory nesting to 128 levels. Alternate traversal allows at most 4,096
+distinct object directories, including the primary store. Exceeding these
+bounds is an error.
+
+When memory mapping is unavailable, pack and index reads share a pool of at
+most 64 open files across the repository and its alternates. Files are reopened
+as needed; reopening a replaced or modified file causes an incomplete scan.
+
 ### Storage outside the repository
 
 A `.git` file, `commondir`, or `objects/info/alternates` can point at Git storage
@@ -813,6 +834,12 @@ anywhere on disk. By default Betterleaks refuses storage outside the repository'
 directory, so a crafted repository cannot make it read, and report the secrets
 of, another repository on the same machine. Linked worktrees created with
 `git worktree add` are allowed because their main repository registers them.
+Shared refs come from the common Git directory; `refs/bisect`, `refs/rewritten`,
+and `refs/worktree` come from the selected worktree. Reflog scanning includes
+the journals of all registered worktrees.
+When `extensions.worktreeConfig` is enabled, worktree remote and branch
+settings override individual shared settings. Unspecified settings are retained,
+and URL rewrite rules are applied after merging.
 
 Repositories cloned with `--shared` or `--reference`, and submodule checkouts
 scanned directly, need `--allow-external-objects`. Relative alternates are not
@@ -831,6 +858,8 @@ come from `GITHUB_TOKEN`, `GITLAB_TOKEN`, or `HUGGINGFACE_TOKEN`/`HF_TOKEN`.
 Tokens are never inferred for other hosts. URLs with credentials, queries, or
 fragments are rejected, and SSH is not supported. The GitHub, GitLab, and Hugging
 Face sources clone and scan repositories the same way.
+HTTP(S) cloning currently supports SHA-1 repositories. Scan an existing local
+clone for SHA-256 repositories.
 
 Fetched packs are indexed as they download, without limiting pack size,
 object count, or object size: plain objects of any size are streamed. Objects
@@ -839,9 +868,9 @@ keeping up to 1 GiB of chains in memory and rebuilding older links when needed.
 Index metadata grows with the object count, about 52 bytes per object. Structural
 limits reject delta chains longer than 4,096 links (Git writes at most 4,095), and
 delta bases or results over 4 GiB (Git deltifies only objects under
-`core.bigFileThreshold`, 512 MiB by default). A corrupt pack or cancellation
-aborts the fetch and removes its temporary files. `--git-max-blob-mib` applies
-to scanning, not fetching.
+`core.bigFileThreshold`, 512 MiB by default). A corrupt pack, a response missing
+a requested pack, or cancellation aborts the fetch and removes its temporary
+files. `--git-max-blob-mib` applies to scanning, not fetching.
 
 ### SDK
 

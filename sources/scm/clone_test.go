@@ -2,12 +2,17 @@
 package scm
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,8 +20,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/stretchr/testify/require"
 )
 
@@ -223,6 +229,44 @@ func TestCloneRequiresEmptyDestination(t *testing.T) {
 	require.Zero(t, requests.Load(), "a rejected destination must not reach the network")
 }
 
+func TestCloneRejectsMissingPack(t *testing.T) {
+	id := strings.Repeat("1", 40)
+	packet := func(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
+	advertisement := packet("# service=git-upload-pack\n") + "0000" +
+		packet(id+" HEAD\x00ofs-delta no-progress symref=HEAD:refs/heads/main\n") +
+		packet(id+" refs/heads/main\n") + "0000"
+	for _, body := range []string{"", "0008NAK\n", "0008NAK\nPACK"} {
+		t.Run(fmt.Sprintf("response-bytes=%d", len(body)), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+					fmt.Fprint(w, advertisement)
+				} else {
+					w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+					fmt.Fprint(w, body)
+				}
+			}))
+			defer server.Close()
+			dest := filepath.Join(t.TempDir(), "clone")
+			require.Error(t, CloneAuthed(t.Context(), server.URL+"/repo.git", "", dest, CloneOptions{}))
+			repo, err := git.PlainOpen(dest)
+			require.NoError(t, err)
+			defer repo.Storer.(*filesystem.Storage).Close()
+			refs, err := repo.References()
+			require.NoError(t, err)
+			require.NoError(t, refs.ForEach(func(ref *plumbing.Reference) error {
+				require.NotEqual(t, plumbing.HashReference, ref.Type(), "failed fetch must not publish advertised refs")
+				return nil
+			}))
+			packs, err := os.ReadDir(filepath.Join(dest, "objects", "pack"))
+			if !errors.Is(err, os.ErrNotExist) {
+				require.NoError(t, err)
+				require.Empty(t, packs, "failed fetch must remove its temporary pack")
+			}
+		})
+	}
+}
+
 // Hosts such as GitHub accept HTTP/2 when a client offers it. The clone client
 // speaks only HTTP/1.1, so it must not offer h2 during the TLS handshake.
 func TestCloneFromHTTP2Server(t *testing.T) {
@@ -234,7 +278,45 @@ func TestCloneFromHTTP2Server(t *testing.T) {
 	require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, CloneOptions{}))
 	repo, err := git.PlainOpen(dest)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, repo.Close()) })
+	t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
+	_, err = repo.CommitObject(plumbing.NewHash(commit))
+	require.NoError(t, err)
+}
+
+func TestCloneWithoutProgressUsesRawPack(t *testing.T) {
+	remote, run := cloneTestRemote(t, false)
+	tree := run("", "mktree")
+	commit := run("", "commit-tree", tree, "-m", "root")
+	run("", "update-ref", "refs/heads/trunk", commit)
+	target, err := url.Parse(remote)
+	require.NoError(t, err)
+	target.Path = ""
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var uploads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "request read failed", http.StatusBadRequest)
+				return
+			}
+			_ = r.Body.Close()
+			if bytes.Contains(body, []byte("side-band")) || !bytes.Contains(body, []byte("no-progress")) {
+				t.Error("a no-progress clone must negotiate the raw pack stream")
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			uploads.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	dest := filepath.Join(t.TempDir(), "clone")
+	require.NoError(t, CloneAuthed(t.Context(), server.URL+"/repo.git", "", dest, CloneOptions{}))
+	require.Positive(t, uploads.Load())
+	repo, err := git.PlainOpen(dest)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
 	_, err = repo.CommitObject(plumbing.NewHash(commit))
 	require.NoError(t, err)
 }
@@ -265,6 +347,10 @@ func TestCloneRefSelection(t *testing.T) {
 		"refs/tags/annotated":   plumbing.NewHash(run("", "rev-parse", "refs/tags/annotated")),
 		"refs/notes/commits":    plumbing.NewHash(run("", "rev-parse", "refs/notes/commits")),
 	}
+	for _, name := range []string{"refs/heads/@", "refs/heads/-existing", "refs/tags/-existing", "refs/tags/@"} {
+		run("", "update-ref", name, main.String())
+		wanted[plumbing.ReferenceName(name)] = main
+	}
 	additional := map[plumbing.ReferenceName]plumbing.Hash{}
 	blobs := map[plumbing.ReferenceName]plumbing.Hash{}
 	for _, name := range []string{
@@ -286,6 +372,7 @@ func TestCloneRefSelection(t *testing.T) {
 		extra   []plumbing.ReferenceName
 	}{
 		{name: "default"},
+		{name: "existing unusual names", options: CloneOptions{Refs: []string{"refs/heads/@", "refs/heads/-existing", "refs/tags/-existing", "refs/tags/@"}}},
 		{name: "one PR", options: CloneOptions{Refs: []string{"refs/pull/1/head"}}, extra: []plumbing.ReferenceName{"refs/pull/1/head"}},
 		{name: "PR heads", options: CloneOptions{Refs: []string{"refs/pull/*/head"}}, extra: []plumbing.ReferenceName{"refs/pull/1/head", "refs/pull/2/head"}},
 		{name: "repeated and overlapping", options: CloneOptions{Refs: []string{"refs/pull/*/head", "refs/pull/1/head", "refs/pull/1/head", "refs/custom/private"}}, extra: []plumbing.ReferenceName{"refs/pull/1/head", "refs/pull/2/head", "refs/custom/private"}},
@@ -298,7 +385,7 @@ func TestCloneRefSelection(t *testing.T) {
 			require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, tc.options))
 			repo, err := git.PlainOpen(dest)
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, repo.Close()) })
+			t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
 			_, err = repo.Worktree()
 			require.ErrorIs(t, err, git.ErrIsBareRepository)
 			require.NoFileExists(t, filepath.Join(dest, "content.txt"))
@@ -401,11 +488,12 @@ func TestClonePublishedRefsWithoutBranches(t *testing.T) {
 			require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, CloneOptions{}))
 			repo, err := git.PlainOpen(dest)
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, repo.Close()) })
-			if kind == "tag-only" || kind == "detached-published" {
+			t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
+			switch kind {
+			case "tag-only", "detached-published":
 				_, err := repo.CommitObject(id)
 				require.NoError(t, err)
-			} else if kind == "review-only" || kind == "detached-review" {
+			case "review-only", "detached-review":
 				require.ErrorIs(t, repo.Storer.HasEncodedObject(id), plumbing.ErrObjectNotFound)
 			}
 			if kind == "detached-published" {

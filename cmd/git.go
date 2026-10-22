@@ -3,12 +3,14 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/betterleaks/betterleaks/v2/pipeline"
 	"github.com/betterleaks/betterleaks/v2/scan"
 	"github.com/betterleaks/betterleaks/v2/sources/gogit"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
@@ -26,7 +28,7 @@ type GitCmd struct {
 	Author          string   `group:"source" help:"Go regular expression matching author name and email."`
 	Committer       string   `group:"source" help:"Go regular expression matching committer name and email."`
 	Revision        string   `group:"source" help:"Revision or range (A..B) from fetched or local history; does not fetch refs. Omit to scan HEAD and all non-note refs."`
-	CommitListFile  string   `group:"source" name:"commit-list-file" placeholder:"PATH" help:"Scan only the listed full commit IDs, one per line, without walking their history. An empty file selects no commits."`
+	CommitListFile  string   `group:"source" name:"commit-list-file" placeholder:"PATH" help:"Scan only the listed full commit IDs, one per line, without walking their history. Use - to read stdin. Empty input selects no commits."`
 	MaxCommits      int      `group:"source" name:"max-commits" help:"Limit selected commits in the history walk; zero is unlimited."`
 	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"Skip blobs larger than this many MiB, with a warning for each."`
 	AllowExternal   bool     `group:"source" name:"allow-external-objects" help:"Read Git storage outside the repository (a .git file, commondir, or object alternate pointing elsewhere)."`
@@ -91,7 +93,21 @@ func runGit(runtime *commandRuntime, globals *GlobalFlags, options *GitCmd) {
 
 	findings := mustNewFindingCollector(runtime, &options.ScanFlags, globals.NoColor, start, cfg, "git", source)
 	findings.startScan(runtime)
-	summary, err := runner.Scan(runtime.Context, src, findings.Add)
+	if options.CommitListFile == "-" {
+		input, closeInput := cancellableStdin(runtime.Context, runtime.stdin)
+		defer closeInput()
+		var data []byte
+		data, err = io.ReadAll(input)
+		if err != nil {
+			err = fmt.Errorf("read commit list from stdin: %w", err)
+		} else {
+			src.Commits = parseCommitList(data)
+		}
+	}
+	var summary pipeline.ScanSummary
+	if err == nil {
+		summary, err = runner.Scan(runtime.Context, src, findings.Add)
+	}
 	if errors.Is(err, gogit.ErrExternalStore) {
 		runtime.Logger().Error("failed to scan Git repository; pass --allow-external-objects to read storage outside it", "error", err)
 	} else if err != nil {
@@ -136,16 +152,14 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 	}
 	var commits []string
 	if cmd.CommitListFile != "" {
-		data, err := os.ReadFile(cmd.CommitListFile)
-		if err != nil {
-			return nil, fmt.Errorf("read commit list: %w", err)
-		}
-		// An empty file selects no commits instead of scanning all history.
+		// Validate stdin options without consuming input before execution.
 		commits = []string{}
-		for line := range strings.Lines(string(data)) {
-			if id := strings.TrimSpace(line); id != "" {
-				commits = append(commits, id)
+		if cmd.CommitListFile != "-" {
+			data, err := os.ReadFile(cmd.CommitListFile)
+			if err != nil {
+				return nil, fmt.Errorf("read commit list: %w", err)
 			}
+			commits = parseCommitList(data)
 		}
 	}
 	repo := cmd.Repo
@@ -176,6 +190,17 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 		MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Exclude: cmd.Exclude,
 		AllowExternalObjects: cmd.AllowExternal, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth,
 	}, nil
+}
+
+func parseCommitList(data []byte) []string {
+	// Empty input selects no commits instead of scanning all history.
+	commits := []string{}
+	for line := range strings.Lines(string(data)) {
+		if id := strings.TrimSpace(line); id != "" {
+			commits = append(commits, id)
+		}
+	}
+	return commits
 }
 
 // An existing path wins even when its spelling resembles a URL.

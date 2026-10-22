@@ -253,20 +253,25 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 	configPath := writeTestConfig(t, "[[rules]]\nid='git-secret'\nregex='SECRET_[A-Z]+'\n")
 	t.Setenv("PATH", t.TempDir())
 	for _, tc := range []struct {
-		name string
-		args []string
-		want []string
+		name  string
+		args  []string
+		input string
+		want  []string
 	}{
-		{"all refs", nil, []string{rootSHA, sideSHA}},
-		{"head", []string{"--revision=HEAD"}, []string{rootSHA}},
-		{"author", []string{"--author=Side"}, []string{sideSHA}},
-		{"date", []string{"--since=2030-01-01"}, nil},
-		{"commit limit", []string{"--revision=side", "--max-commits=1"}, []string{sideSHA}},
-		{"commit list", []string{"--commit-list-file=" + commitList}, []string{sideSHA}},
-		{"empty commit list", []string{"--commit-list-file=" + emptyList}, nil},
+		{"all refs", nil, "", []string{rootSHA, sideSHA}},
+		{"head", []string{"--revision=HEAD"}, "", []string{rootSHA}},
+		{"author", []string{"--author=Side"}, "", []string{sideSHA}},
+		{"date", []string{"--since=2030-01-01"}, "", nil},
+		{"commit limit", []string{"--revision=side", "--max-commits=1"}, "", []string{sideSHA}},
+		{"commit list", []string{"--commit-list-file=" + commitList}, "", []string{sideSHA}},
+		{"empty commit list", []string{"--commit-list-file=" + emptyList}, "", nil},
+		{"stdin commit list", []string{"--commit-list-file=-"}, "\r\n  " + sideSHA + " \r\n\n" + sideSHA, []string{sideSHA}},
+		{"empty stdin", []string{"--commit-list-file=-"}, "", nil},
+		{"blank stdin", []string{"--commit-list-file=-"}, " \r\n\t\n", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, stdout := newTestCLI(t)
+			root.SetIn(strings.NewReader(tc.input))
 			args := append([]string{"git", repo, "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}, tc.args...)
 			root.SetArgs(args)
 			require.NoError(t, root.Execute())
@@ -281,6 +286,23 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 	}
 }
 
+func TestGitCommitListStdinRejectsInvalidID(t *testing.T) {
+	configPath := writeTestConfig(t, "[[rules]]\nid='token'\nregex='TOKEN'\n")
+	root, stdout := newTestCLI(t)
+	root.SetIn(strings.NewReader("abc1234\n"))
+	var logs bytes.Buffer
+	root.runtime.stderr = &logs
+	var exitCode int
+	root.runtime.exit = func(code int) { exitCode = code }
+	root.SetArgs([]string{"git", t.TempDir(), "--commit-list-file=-", "--config", configPath, "--no-banner", "--output=-"})
+	require.NoError(t, root.Execute())
+	metadata, findings := decodeScanJSON(t, stdout.Bytes())
+	require.Equal(t, report.ScanStateIncomplete, metadata.State)
+	require.Equal(t, 1, exitCode)
+	require.Empty(t, findings)
+	require.Contains(t, logs.String(), "invalid commit ID")
+}
+
 //nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestGoGitOptionValidation(t *testing.T) {
 	abbreviated := filepath.Join(t.TempDir(), "commits.txt")
@@ -292,6 +314,8 @@ func TestGoGitOptionValidation(t *testing.T) {
 		{Repo: "https://example.test/repo", CloneRefs: []string{"main"}},
 		{CommitListFile: filepath.Join(t.TempDir(), "missing")},
 		{CommitListFile: abbreviated},
+		{CommitListFile: "-", Revision: "HEAD"},
+		{CommitListFile: "-", Include: []string{"reflogs"}},
 	} {
 		require.Error(t, cmd.Validate())
 	}

@@ -590,6 +590,7 @@ Notes are scanned when `--include=notes` is selected.
 betterleaks git .                                # all history
 betterleaks git . --revision=origin/main..HEAD   # commits not yet on origin/main
 betterleaks git . --commit-list-file=commits.txt # only the listed commits
+git rev-list main..feature | betterleaks git . --commit-list-file=-
 betterleaks git . --include=commit-messages,notes
 betterleaks git . --since=2026-01-01 --author='Example <'
 betterleaks git https://github.com/owner/repo
@@ -607,7 +608,7 @@ validation, and diagnostic flags are also available; see `betterleaks git --help
 | `--clone-ref` | None | Add a fully qualified ref or pattern to the URL fetch; repeatable. |
 | `--clone-all-refs` | Off | Fetch all advertised refs under `refs/`; URL scans only. |
 | `--revision` | HEAD and all non-note refs | Start at a revision, or select an `A..B` range, from available history. |
-| `--commit-list-file` | None | Scan only the full commit IDs listed in a file, without walking their history. |
+| `--commit-list-file` | None | Scan only the full commit IDs listed in a file, or stdin with `-`, without walking their history. |
 | `--since`, `--until` | Unbounded | Inclusive committer-date bounds, RFC3339 or `YYYY-MM-DD` (UTC). |
 | `--author`, `--committer` | No filter | Go regular expressions over `Name <email>`. |
 | `--max-commits` | `0` (unlimited) | Limit selected commits in the history walk. |
@@ -704,11 +705,12 @@ content counts as unreachable. `objects` includes the unreachable blobs.
   A full object ID naming a blob, tree, or missing object fails even if a branch
   has the same name. Use `refs/heads/NAME` to select such a branch explicitly.
 - `--commit-list-file=PATH` scans exactly the full commit IDs in PATH, one per
-  line; surrounding whitespace and blank lines are ignored. Duplicate commits
-  are scanned once. Earlier commits are not selected automatically. Each selected
-  commit is compared with its first parent. Annotated tags select the commits they
-  point to; an ID naming a blob, tree, or missing object fails the scan. An empty file scans
-  no commits. It cannot be combined with `--revision` or `--include=reflogs`.
+  line; use `--commit-list-file=-` to read the list from stdin. Surrounding
+  whitespace and blank lines are ignored. Duplicate commits are scanned once.
+  Earlier commits are not selected automatically. Each selected commit is compared
+  with its first parent. Annotated tags select the commits they point to; an ID
+  naming a blob, tree, or missing object fails the scan. Empty input scans no
+  commits. It cannot be combined with `--revision` or `--include=reflogs`.
   Date and identity filters and `--max-commits` still apply. Merge patches still
   require `--include=merges`.
 - `--since` and `--until` filter by committer time, in RFC3339 or `YYYY-MM-DD`

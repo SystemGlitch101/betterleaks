@@ -3,11 +3,13 @@ package cmd
 import (
 	"archive/zip"
 	"bytes"
+	"fmt"
 	"net/http/cgi"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -275,7 +277,8 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 			args := append([]string{"git", repo, "--config", configPath, "--no-banner", "--exit-code=0", "--output=-"}, tc.args...)
 			root.SetArgs(args)
 			require.NoError(t, root.Execute())
-			_, findings := decodeScanJSON(t, stdout.Bytes())
+			metadata, findings := decodeScanJSON(t, stdout.Bytes())
+			require.Equal(t, report.ScanStateComplete, metadata.State)
 			var commits []string
 			for _, finding := range findings {
 				require.Len(t, finding.Attributes["git.blob_sha"], 40)
@@ -284,36 +287,100 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 			require.ElementsMatch(t, tc.want, commits)
 		})
 	}
+	t.Run("pipe commit list", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("requires /dev/fd")
+		}
+		reader, writer, err := os.Pipe()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = reader.Close() })
+		t.Cleanup(func() { _ = writer.Close() })
+		_, err = writer.WriteString(sideSHA)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		root, stdout := newTestCLI(t)
+		root.SetArgs([]string{
+			"git", repo, fmt.Sprintf("--commit-list-file=/dev/fd/%d", reader.Fd()),
+			"--config", configPath, "--no-banner", "--exit-code=0", "--output=-",
+		})
+		require.NoError(t, root.Execute())
+		metadata, findings := decodeScanJSON(t, stdout.Bytes())
+		require.Equal(t, report.ScanStateComplete, metadata.State)
+		require.Len(t, findings, 1)
+		require.Equal(t, sideSHA, findings[0].Attributes["git.sha"])
+	})
 }
 
-func TestGitCommitListStdinRejectsInvalidID(t *testing.T) {
+func TestGitCommitListInputErrors(t *testing.T) {
 	configPath := writeTestConfig(t, "[[rules]]\nid='token'\nregex='TOKEN'\n")
-	root, stdout := newTestCLI(t)
-	root.SetIn(strings.NewReader("abc1234\n"))
-	var logs bytes.Buffer
-	root.runtime.stderr = &logs
-	var exitCode int
-	root.runtime.exit = func(code int) { exitCode = code }
-	root.SetArgs([]string{"git", t.TempDir(), "--commit-list-file=-", "--config", configPath, "--no-banner", "--output=-"})
-	require.NoError(t, root.Execute())
-	metadata, findings := decodeScanJSON(t, stdout.Bytes())
-	require.Equal(t, report.ScanStateIncomplete, metadata.State)
-	require.Equal(t, 1, exitCode)
-	require.Empty(t, findings)
-	require.Contains(t, logs.String(), "invalid commit ID")
+	for _, tc := range []struct {
+		name  string
+		input string
+		err   string
+	}{
+		{"invalid ID", strings.Repeat("a", 40) + "\nabc1234\n", "invalid commit ID"},
+		{"missing file", "", "open commit list"},
+	} {
+		for _, mode := range []string{"file", "stdin"} {
+			if tc.name == "missing file" && mode == "stdin" {
+				continue
+			}
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				path := "-"
+				if mode == "file" {
+					path = filepath.Join(t.TempDir(), "commits.txt")
+					if tc.name != "missing file" {
+						require.NoError(t, os.WriteFile(path, []byte(tc.input), 0600))
+					}
+				}
+				root, stdout := newTestCLI(t)
+				root.SetIn(strings.NewReader(tc.input))
+				var logs bytes.Buffer
+				root.runtime.stderr = &logs
+				var exitCode int
+				root.runtime.exit = func(code int) { exitCode = code }
+				root.SetArgs([]string{"git", t.TempDir(), "--commit-list-file=" + path, "--max-commits=1", "--config", configPath, "--no-banner", "--output=-"})
+				require.NoError(t, root.Execute())
+				metadata, findings := decodeScanJSON(t, stdout.Bytes())
+				require.Equal(t, report.ScanStateIncomplete, metadata.State)
+				require.Equal(t, 1, exitCode)
+				require.Empty(t, findings)
+				require.Contains(t, logs.String(), tc.err)
+			})
+		}
+	}
+}
+
+func TestReadCommitList(t *testing.T) {
+	const limit = 1 << 20
+	id := strings.Repeat("a", 40)
+	other := strings.Repeat("b", 64)
+	t.Run("duplicates", func(t *testing.T) {
+		commits, err := readCommitList(strings.NewReader(id+"\n"+strings.ToUpper(id)+"\n"+other), limit)
+		require.NoError(t, err)
+		require.Equal(t, []string{id, other}, commits)
+	})
+	t.Run("at byte limit", func(t *testing.T) {
+		commits, err := readCommitList(strings.NewReader(strings.Repeat("\n", limit-len(id))+id), limit)
+		require.NoError(t, err)
+		require.Equal(t, []string{id}, commits)
+	})
+	t.Run("over byte limit", func(t *testing.T) {
+		input := strings.NewReader(strings.Repeat("\n", limit+2))
+		commits, err := readCommitList(input, limit)
+		require.ErrorContains(t, err, "commit list exceeds 1 MiB")
+		require.Nil(t, commits)
+		require.Equal(t, 1, input.Len())
+	})
 }
 
 //nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestGoGitOptionValidation(t *testing.T) {
-	abbreviated := filepath.Join(t.TempDir(), "commits.txt")
-	require.NoError(t, os.WriteFile(abbreviated, []byte("abc1234\n"), 0600))
 	for _, cmd := range []GitCmd{
 		{Exclude: []string{"unknown"}}, {Exclude: []string{"history"}}, {Include: []string{"notes"}, Exclude: []string{"notes"}}, {Exclude: []string{""}}, {Author: "["}, {Since: "yesterday"}, {Until: "2001-01-01", Since: "2001-01-02"},
 		{MaxCommits: -1}, {GitMaxBlobMiB: -1}, {GitMaxBlobMiB: 4097}, {Revision: "main...side"},
 		{CloneRefs: []string{"refs/pull/1/head"}}, {CloneAllRefs: true},
 		{Repo: "https://example.test/repo", CloneRefs: []string{"main"}},
-		{CommitListFile: filepath.Join(t.TempDir(), "missing")},
-		{CommitListFile: abbreviated},
 		{CommitListFile: "-", Revision: "HEAD"},
 		{CommitListFile: "-", Include: []string{"reflogs"}},
 	} {

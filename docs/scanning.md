@@ -712,7 +712,10 @@ content counts as unreachable. `objects` includes the unreachable blobs.
   naming a blob, tree, or missing object fails the scan. Empty input scans no
   commits. It cannot be combined with `--revision` or `--include=reflogs`.
   Date and identity filters and `--max-commits` still apply. Merge patches still
-  require `--include=merges`.
+  require `--include=merges`. Files and stdin are read once during execution,
+  with a 256 MiB input limit, including whitespace and duplicate IDs. Oversized
+  input fails the scan rather than scanning a partial list. `--max-commits` does
+  not reduce how much of the input list is read or validated.
 - `--since` and `--until` filter by committer time, in RFC3339 or `YYYY-MM-DD`
   (UTC). A date-only `--until` includes that whole day. Filtering never prunes the
   walk, so backdated commits are still found.

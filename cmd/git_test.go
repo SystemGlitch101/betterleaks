@@ -243,17 +243,27 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "branch.txt"), []byte("SECRET_TWO\n"), 0644))
 	gitCmdT(t, repo, "add", ".")
 	gitCmdT(t, repo, "-c", "user.name=Side", "commit", "-qm", "side")
+	sideSHA := gitCmdT(t, repo, "rev-parse", "HEAD")
+	commitList := filepath.Join(t.TempDir(), "commits.txt")
+	require.NoError(t, os.WriteFile(commitList, []byte("\r\n  "+sideSHA+" \r\n\n"+sideSHA), 0600))
+	emptyList := filepath.Join(t.TempDir(), "empty.txt")
+	require.NoError(t, os.WriteFile(emptyList, nil, 0600))
 	gitCmdT(t, repo, "checkout", "-q", "main")
 	gitCmdT(t, repo, "repack", "-ad")
 	configPath := writeTestConfig(t, "[[rules]]\nid='git-secret'\nregex='SECRET_[A-Z]+'\n")
 	t.Setenv("PATH", t.TempDir())
 	for _, tc := range []struct {
-		name  string
-		args  []string
-		count int
+		name string
+		args []string
+		want []string
 	}{
-		{"all refs", nil, 2}, {"head", []string{"--revision=HEAD"}, 1}, {"author", []string{"--author=Side"}, 1}, {"date", []string{"--since=2030-01-01"}, 0},
-		{"commit limit", []string{"--revision=side", "--max-commits=1"}, 1},
+		{"all refs", nil, []string{rootSHA, sideSHA}},
+		{"head", []string{"--revision=HEAD"}, []string{rootSHA}},
+		{"author", []string{"--author=Side"}, []string{sideSHA}},
+		{"date", []string{"--since=2030-01-01"}, nil},
+		{"commit limit", []string{"--revision=side", "--max-commits=1"}, []string{sideSHA}},
+		{"commit list", []string{"--commit-list-file=" + commitList}, []string{sideSHA}},
+		{"empty commit list", []string{"--commit-list-file=" + emptyList}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, stdout := newTestCLI(t)
@@ -261,22 +271,27 @@ func TestGoGitHistoryWithoutExecutable(t *testing.T) {
 			root.SetArgs(args)
 			require.NoError(t, root.Execute())
 			_, findings := decodeScanJSON(t, stdout.Bytes())
-			require.Len(t, findings, tc.count)
+			var commits []string
 			for _, finding := range findings {
 				require.Len(t, finding.Attributes["git.blob_sha"], 40)
-				require.Len(t, finding.Attributes["git.sha"], 40)
+				commits = append(commits, finding.Attributes["git.sha"])
 			}
+			require.ElementsMatch(t, tc.want, commits)
 		})
 	}
 }
 
 //nolint:exhaustruct // Fixtures specify only the options relevant to the scenario.
 func TestGoGitOptionValidation(t *testing.T) {
+	abbreviated := filepath.Join(t.TempDir(), "commits.txt")
+	require.NoError(t, os.WriteFile(abbreviated, []byte("abc1234\n"), 0600))
 	for _, cmd := range []GitCmd{
 		{Exclude: []string{"unknown"}}, {Exclude: []string{"history"}}, {Include: []string{"notes"}, Exclude: []string{"notes"}}, {Exclude: []string{""}}, {Author: "["}, {Since: "yesterday"}, {Until: "2001-01-01", Since: "2001-01-02"},
 		{MaxCommits: -1}, {GitMaxBlobMiB: -1}, {GitMaxBlobMiB: 4097}, {Revision: "main...side"},
 		{CloneRefs: []string{"refs/pull/1/head"}}, {CloneAllRefs: true},
 		{Repo: "https://example.test/repo", CloneRefs: []string{"main"}},
+		{CommitListFile: filepath.Join(t.TempDir(), "missing")},
+		{CommitListFile: abbreviated},
 	} {
 		require.Error(t, cmd.Validate())
 	}

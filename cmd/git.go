@@ -26,6 +26,7 @@ type GitCmd struct {
 	Author          string   `group:"source" help:"Go regular expression matching author name and email."`
 	Committer       string   `group:"source" help:"Go regular expression matching committer name and email."`
 	Revision        string   `group:"source" help:"Revision or range (A..B) from fetched or local history; does not fetch refs. Omit to scan HEAD and all non-note refs."`
+	CommitListFile  string   `group:"source" name:"commit-list-file" placeholder:"PATH" help:"Scan only the listed full commit IDs, one per line, without walking their history. An empty file selects no commits."`
 	MaxCommits      int      `group:"source" name:"max-commits" help:"Limit selected commits in the history walk; zero is unlimited."`
 	GitMaxBlobMiB   int      `group:"source" name:"git-max-blob-mib" default:"64" help:"Skip blobs larger than this many MiB, with a warning for each."`
 	AllowExternal   bool     `group:"source" name:"allow-external-objects" help:"Read Git storage outside the repository (a .git file, commondir, or object alternate pointing elsewhere)."`
@@ -133,6 +134,20 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 	if err != nil {
 		return nil, err
 	}
+	var commits []string
+	if cmd.CommitListFile != "" {
+		data, err := os.ReadFile(cmd.CommitListFile)
+		if err != nil {
+			return nil, fmt.Errorf("read commit list: %w", err)
+		}
+		// An empty file selects no commits instead of scanning all history.
+		commits = []string{}
+		for line := range strings.Lines(string(data)) {
+			if id := strings.TrimSpace(line); id != "" {
+				commits = append(commits, id)
+			}
+		}
+	}
 	repo := cmd.Repo
 	if repo == "" {
 		repo = "."
@@ -156,7 +171,8 @@ func (cmd GitCmd) gitSource() (*gogit.Source, error) {
 	return &gogit.Source{
 		RepoPath: repo, URL: url, Token: token,
 		CloneRefs: cmd.CloneRefs, CloneAllRefs: cmd.CloneAllRefs,
-		Revision: cmd.Revision, Since: since, Until: until, Author: cmd.Author, Committer: cmd.Committer, MaxCount: cmd.MaxCommits,
+		Revision: cmd.Revision, Commits: commits, MaxCount: cmd.MaxCommits,
+		Since: since, Until: until, Author: cmd.Author, Committer: cmd.Committer,
 		MaxBlobBytes: int64(cmd.GitMaxBlobMiB) << 20, Include: cmd.Include, Exclude: cmd.Exclude,
 		AllowExternalObjects: cmd.AllowExternal, Platform: platform, MaxArchiveDepth: cmd.MaxArchiveDepth,
 	}, nil
